@@ -1,0 +1,129 @@
+// netlify/functions/send-confirmation.js
+//
+// Sends an automatic confirmation email to the parent/enquirer after they
+// submit the Free Trial or Contact form on the Arham Academy website.
+//
+// HOW THIS GETS TRIGGERED (one-time setup, done in the Netlify dashboard, no code needed):
+//   1. Deploy this site to Netlify.
+//   2. Go to Site settings -> Forms -> Form notifications -> Add notification -> Outgoing webhook.
+//   3. Set the URL to:  https://YOUR-SITE-NAME.netlify.app/.netlify/functions/send-confirmation
+//   4. Repeat for both forms ("trial-request" and "contact-message"), or add one webhook
+//      that listens to all form submissions (Netlify supports both options).
+//
+// REQUIRED SETUP BEFORE THIS WILL ACTUALLY SEND EMAIL:
+//   This function uses Resend (resend.com) because it has a simple API and a free tier
+//   generous enough for a small business. You are free to swap in SendGrid, Mailgun,
+//   Postmark, etc. -- just replace the fetch() call below with that provider's API.
+//
+//   1. Create a free account at https://resend.com
+//   2. Verify a sending domain (or use their test domain while developing).
+//   3. Create an API key.
+//   4. In Netlify: Site settings -> Environment variables, add:
+//        RESEND_API_KEY   = your Resend API key
+//        FROM_EMAIL       = e.g. "Arham Academy <hello@arhamacademy.org>"
+//   5. Redeploy the site so the new environment variables are picked up.
+//
+// Until the environment variables above are set, this function will safely no-op
+// (it will log a warning and return 200 so Netlify does not retry it endlessly).
+
+exports.handler = async function (event) {
+  if (event.httpMethod !== "POST") {
+    return { statusCode: 405, body: "Method Not Allowed" };
+  }
+
+  let payload;
+  try {
+    payload = JSON.parse(event.body).payload;
+  } catch (err) {
+    console.error("Could not parse Netlify form webhook payload:", err);
+    return { statusCode: 400, body: "Bad Request" };
+  }
+
+  const formName = payload.form_name;
+  const data = payload.data || {};
+
+  const recipientEmail = data["Email Address"] || data["Email"];
+  if (!recipientEmail) {
+    console.warn("No recipient email found in submission, skipping confirmation email.");
+    return { statusCode: 200, body: "No email to send to." };
+  }
+
+  const apiKey = process.env.RESEND_API_KEY;
+  const fromEmail = process.env.FROM_EMAIL || "Arham Academy <onboarding@resend.dev>";
+
+  if (!apiKey) {
+    console.warn("RESEND_API_KEY is not set. Skipping confirmation email. See comments at the top of this file for setup steps.");
+    return { statusCode: 200, body: "Email sending not configured yet." };
+  }
+
+  const parentName = data["Parent Full Name"] || data["Name"] || "there";
+  const firstName = String(parentName).split(" ")[0];
+
+  let subject, introLine, nextSteps;
+
+  if (formName === "trial-request") {
+    subject = "Your Free Trial Request - Arham Academy";
+    introLine = `Thank you for booking a free trial with Arham Academy for ${data["Student Name"] || "your child"}. We're excited to welcome your family, in sha Allah.`;
+    nextSteps = [
+      "Our team will review your request and reach out via WhatsApp or email within 2 hours.",
+      `We'll confirm a class time that works for ${data["Preferred Time"] ? "your preferred time (" + data["Preferred Time"] + ")" : "your schedule"}.`,
+      `Your child will be matched with a teacher suited to the ${data["Program of Interest"] || "program"} you selected.`,
+      "Your first class is completely free, with no payment details required.",
+    ];
+  } else {
+    subject = "We've Received Your Message - Arham Academy";
+    introLine = "Thank you for reaching out to Arham Academy. We've received your message and a member of our team will reply personally.";
+    nextSteps = [
+      "We typically reply within a few hours, in sha Allah.",
+      "If your question is about enrolling, we'll also share how to book a free trial.",
+      "For anything urgent, you're welcome to message us directly on WhatsApp at +92 316 710 3356.",
+    ];
+  }
+
+  const stepsHtml = nextSteps.map((s) => `<li style="margin-bottom:8px">${s}</li>`).join("");
+
+  const html = `
+  <div style="font-family:Arial,sans-serif;background:#f7f9fb;padding:32px 16px">
+    <div style="max-width:520px;margin:0 auto;background:#fff;border-radius:16px;overflow:hidden;border:1px solid #e2e6ea">
+      <div style="background:linear-gradient(135deg,#0d7a5f,#095c47);padding:28px 30px;text-align:center">
+        <h1 style="color:#fff;font-size:20px;margin:0">Arham Academy</h1>
+      </div>
+      <div style="padding:30px">
+        <p style="font-size:15px;color:#1c2636;line-height:1.6">Assalamu Alaikum ${firstName},</p>
+        <p style="font-size:15px;color:#1c2636;line-height:1.6">${introLine}</p>
+        <h2 style="font-size:16px;color:#0e2040;margin:24px 0 10px">What happens next</h2>
+        <ul style="font-size:14px;color:#49576a;line-height:1.6;padding-left:20px">${stepsHtml}</ul>
+        <p style="font-size:14px;color:#49576a;line-height:1.6;margin-top:22px">If you have any questions in the meantime, simply reply to this email or message us on WhatsApp.</p>
+        <a href="https://wa.me/923167103356" style="display:inline-block;margin-top:10px;background:#25d366;color:#fff;padding:11px 22px;border-radius:999px;text-decoration:none;font-weight:bold;font-size:14px">Message Us on WhatsApp</a>
+        <p style="font-size:13px;color:#8a96a5;line-height:1.6;margin-top:28px">JazakAllah Khayran,<br>The Arham Academy Team</p>
+      </div>
+    </div>
+  </div>`;
+
+  try {
+    const res = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        from: fromEmail,
+        to: recipientEmail,
+        subject: subject,
+        html: html,
+      }),
+    });
+
+    if (!res.ok) {
+      const errText = await res.text();
+      console.error("Resend API error:", errText);
+      return { statusCode: 200, body: "Email provider error, logged." };
+    }
+
+    return { statusCode: 200, body: "Confirmation email sent." };
+  } catch (err) {
+    console.error("Failed to send confirmation email:", err);
+    return { statusCode: 200, body: "Failed to send, logged." };
+  }
+};
